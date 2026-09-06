@@ -89,7 +89,7 @@ Three callers, in the order they arrive:
   own. `agent-coder`'s exit code taxonomy (§4.5) exists so the *caller* can make those
   decisions.
 - **Cancelling a run** — deliberately deferred, see [§8](#8-not-doing-and-why).
-- **Logs, traces, `RunResult` subpaths, streaming progress** — see [§3.4](#34-what-the-status-endpoint-can-honestly-say) for why these are gated on `agent-coder`, not on us.
+- **Logs, traces, `RunResult` subpaths, streaming progress** — see [§8](#8-not-doing-and-why) for why these are gated on `agent-coder`, not on us.
 - **Listing tasks.** The UI caller will want it; v1 does not have it (see [§9](#9-ideas-for-future-versions)).
 - **Concurrency caps and budget enforcement.** Discussed, rejected for v1, consequences written down in [§8](#8-not-doing-and-why).
 - **Any runtime other than Cloud Run Jobs.** No GKE seam.
@@ -182,6 +182,22 @@ the run, and the value it will pass to `GET /tasks/{taskId}`.
 Read the Task Record. If its status is non-terminal, refresh it from the Cloud Run
 Executions API, persist the refreshed status, and return.
 
+**What it can honestly say — and what it can't.** `agent-coder`'s exit code taxonomy (§4.5)
+exists to separate outcomes that demand opposite responses: `20` (the agent could not solve
+it — do not retry) versus `30` (infra failed — do retry). That distinction is the most
+valuable thing this endpoint could return, and **v1 probably cannot return it.** The Cloud
+Run Admin API reports execution-level succeeded/failed counts; a per-attempt exit code, if
+exposed at all, lives on a different resource than the execution itself. The exact shape
+must be checked against Google's Cloud Run Admin API v2 reference before the response model
+is fixed — not asserted from memory (OQ-01).
+
+So v1 commits only to what is certainly available: `running` / `succeeded` / `failed`
+derived from execution state, plus an `exitCode` populated *if* it turns out to be cheaply
+readable and `null` otherwise. The full-fidelity answer arrives when `agent-coder`
+implements `RunResult` / `task-output.json` (its §4.3, **not built yet**), at which point
+this endpoint reads one GCS object and reports `status`, `prUrl`, `tokenUsage` and the rest
+properly. That is the real plan; Cloud Run's execution state is the stopgap.
+
 **Refresh-on-read, not pushed.** The alternative is to have Cloud Run execution state
 changes arrive via Eventarc/Pub-Sub and update records asynchronously, making `GET` a pure
 Mongo read. That is the better design *the day a UI lists fifty tasks and triggers fifty
@@ -221,35 +237,6 @@ rename, the registry holds both and makes the seam explicit. If the two are ever
 
 `requiredTaskFields` is what turns the pass-through of [§3.1](#31-post-agentsagentidtasks--dispatch-a-task) into something safer
 than a shrug.
-
-### 3.4 What the status endpoint can honestly say
-
-This is the part of the design most likely to disappoint, so it gets said out loud.
-
-`agent-coder`'s exit code taxonomy (§4.5) exists to separate outcomes that demand opposite
-responses: `20` (the agent could not solve it — do not retry) versus `30` (infra failed —
-do retry). **That distinction is the most valuable thing a status endpoint could return.**
-
-Whether v1 can return it is **unverified**. The Cloud Run Admin API reports execution-level
-succeeded/failed counts; a per-attempt exit code, if exposed at all, lives on a different
-resource than the execution itself. The exact shape must be checked against Google's
-Cloud Run Admin API v2 reference before the response model is fixed — not asserted from
-memory. See OQ-01.
-
-So v1 commits only to what is certainly available:
-
-- **`running` / `succeeded` / `failed`** — derived from execution state.
-- **`exitCode`** — populated *if* cheaply readable, `null` otherwise.
-
-The full-fidelity answer arrives when `agent-coder` implements `RunResult` /
-`task-output.json` (its §4.3, **not built yet**), at which point this service reads one GCS
-object and reports `status`, `prUrl`, `tokenUsage` and the rest properly. That is the real
-plan; the Cloud Run status is the stopgap.
-
-**Corollary:** don't build `/trace` yet either. `trace.json` is uploaded only after the
-agent subprocess exits (`agent-coder` §3.4), so a `/trace` endpoint would 404 for the
-entire 5–30 minutes anyone actually wants it, then return a wall of raw stdout. Worse than
-not having it.
 
 ---
 
@@ -457,8 +444,11 @@ Per `AGENTS.md`, request/response interfaces are private to their delegate file:
 - **Typed per-agent task payloads** — would give better validation errors today, but every
   new agent would become a code change, defeating the registry. `requiredTaskFields` is the
   compromise.
-- **`/logs`, `/trace`, `RunResult` subpaths** — gated on `agent-coder`, not on us. `trace.json`
-  only exists after the run ends; `task-output.json` doesn't exist at all yet. See [§3.4](#34-what-the-status-endpoint-can-honestly-say).
+- **`/logs`, `/trace`, `RunResult` subpaths** — gated on `agent-coder`, not on us.
+  `task-output.json` does not exist there yet at all. And `trace.json` is uploaded only
+  after the agent subprocess exits (`agent-coder` §3.4), so a `/trace` endpoint would 404
+  for the entire 5–30 minutes anyone actually wants it, then return a wall of raw stdout —
+  worse than not having it.
 - **Streaming progress (SSE/websocket)** — needs `agent-coder`'s `AgentEvent`/`EventSink`
   (its §3.4), which is unbuilt. We'd be building both halves of a protocol at once.
 - **Listing tasks** — the UI caller needs it and v1 doesn't have it. Called out honestly
