@@ -73,3 +73,15 @@ describe('Agent.taskFileObjectName', () => {
     })
 
 })
+
+describe('Agent.taskFileGsPath', () => {
+
+    it('builds the full gs:// path of the Task File', () => {
+
+        const agent = coderAgent({ requiredTaskFields: [] });
+
+        assert.strictEqual(agent.taskFileGsPath({ bucketName: "totoexperiments-agents-data", taskId: "5f3c1e7a" }), "gs://totoexperiments-agents-data/coder/5f3c1e7a/task.json");
+
+    })
+
+})

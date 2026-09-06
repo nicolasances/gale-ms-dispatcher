@@ -54,32 +54,12 @@ describe('PostAgentTask.parseRequest', () => {
 
 })
 
+/**
+ * do() writes to GCS and Mongo, so only the paths that reject *before* any side effect are unit tested here.
+ * The dispatch happy path is covered by the pure units it composes (Agent, TaskFile, TaskRecord) and verified
+ * against the dev project by hand.
+ */
 describe('PostAgentTask.do', () => {
-
-    it('dispatches a valid task, returning a minted taskId and the Task File path', async () => {
-
-        process.env.GCP_PID = "totoexperiments";
-        const delegate = new PostAgentTask(null as any, new ControllerConfig(null as any));
-
-        const response = await delegate.do({ agentId: "agent-coder", payload: { repoURL: "https://github.com/x/y.git", issueURL: "https://github.com/x/y/issues/3" } } as any);
-
-        assert.ok(response.taskId, "expected a minted taskId");
-        assert.strictEqual(response.agentId, "agent-coder");
-        assert.strictEqual(response.taskFile, `gs://totoexperiments-agents-data/coder/${response.taskId}/task.json`);
-
-    })
-
-    it('mints a different taskId for every dispatch', async () => {
-
-        process.env.GCP_PID = "totoexperiments";
-        const delegate = new PostAgentTask(null as any, new ControllerConfig(null as any));
-
-        const first = await delegate.do({ agentId: "agent-coder", payload: { repoURL: "https://github.com/x/y.git", issueURL: "https://github.com/x/y/issues/3" } } as any);
-        const second = await delegate.do({ agentId: "agent-coder", payload: { repoURL: "https://github.com/x/y.git", issueURL: "https://github.com/x/y/issues/3" } } as any);
-
-        assert.notStrictEqual(first.taskId, second.taskId);
-
-    })
 
     it('rejects an unregistered agent with a 404', async () => {
 

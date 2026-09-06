@@ -26,7 +26,7 @@ const AGENTS: Agent[] = [
 export class ControllerConfig extends TotoControllerConfig {
 
     getMongoSecretNames(): { userSecretName: string; pwdSecretName: string; } | null {
-        return null;
+        return { userSecretName: 'gale-ms-dispatcher-mongo-user', pwdSecretName: 'gale-ms-dispatcher-mongo-pswd' };
     }
 
     getProps(): APIOptions {

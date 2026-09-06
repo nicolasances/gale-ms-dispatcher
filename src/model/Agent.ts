@@ -61,6 +61,20 @@ export class Agent {
     }
 
     /**
+     * Builds the full gs:// path of the Task File for a given task.
+     *
+     * @param {string} bucketName - the agents-data bucket
+     * @param {string} taskId - the minted task id
+     *
+     * @returns {string} the full gs:// path
+     */
+    taskFileGsPath({ bucketName, taskId }: { bucketName: string, taskId: string }): string {
+
+        return `gs://${bucketName}/${this.taskFileObjectName({ taskId: taskId })}`;
+
+    }
+
+    /**
      * Checks that a task payload field carries an actual value.
      *
      * @param {any} value - the field's value
