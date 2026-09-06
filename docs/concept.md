@@ -5,6 +5,15 @@
 > [Appendix A](#appendix-a--current-repo-state-vs-target) for exactly what exists today.
 > Last revised: 2026-09-06.
 >
+> **Depends on a change not yet made in `agent-coder`.** §4.3's Task File drops the
+> free-form `prompt` field in favour of an `issueURL`, on the reasoning in
+> [§3.1](#31-post-agentsagentidtasks--dispatch-a-task) ("the payload names a target, never a
+> behaviour"). `agent-coder`'s `TaskSpec` still requires `prompt` today
+> (`runner/model/task.py`). Until that changes, the shapes in §4.3 and §4.5 describe the
+> intended contract, not the current one. Worth recording what it buys there: that repo's
+> OQ-11 (derive the branch name from the prompt — plain slug, or a summarisation call?)
+> disappears, since `issue-{n}` is derivable without a model in the loop.
+>
 > This document deliberately borrows its vocabulary from
 > [`agent-coder/docs/concept.md`](https://github.com/nicolasances/agent-coder/blob/main/docs/concept.md)
 > §2. Where a term is defined there, it means the same thing here. That doc calls this
@@ -72,9 +81,10 @@ Three callers, in the order they arrive:
   GCS folder name, and the `TASK_ID` execution override are the same value by convention
   only (`agent-coder` §4.1, §4.4). Getting one wrong produces a container that starts and
   then can't find its work.
-- **`repoURL` is required in practice but unvalidated in code.** `TaskSpec.from_dict()`
-  only checks `taskId` and `prompt`, then indexes `task_details["repoURL"]` directly. A
-  Task File missing it fails inside the container instead of at the API boundary.
+- **The agent's own validation is thinner than its needs.** `TaskSpec.from_dict()` checks
+  only two fields, then indexes the rest of the dict directly — so a Task File missing
+  `repoURL` fails with a `KeyError` inside the container instead of a `400` at the API
+  boundary. Validating against a declared field list is cheaper here than there.
 - **"What happened to that run?" has no answer outside the GCP console.** No id you can
   hand to a UI, no record that survives Cloud Run's execution retention.
 - **The `agentId → job → bucket prefix` mapping is written down nowhere.** `agent-coder`
@@ -84,7 +94,7 @@ Three callers, in the order they arrive:
 ### 1.4 Out of scope (v1)
 
 - **Deciding that a task exists.** No GitHub webhook, no issue-label trigger, no planner.
-  Something else forms the prompt; this service runs it.
+  Something else decides an issue is worth an agent's time; this service dispatches it.
 - **Orchestration.** No retries, no scheduling, no task dependencies, no timeouts of our
   own. `agent-coder`'s exit code taxonomy (§4.5) exists so the *caller* can make those
   decisions.
@@ -105,7 +115,7 @@ Three callers, in the order they arrive:
 | **Agent** | A containerised worker that takes one Task and terminates. Identified by an `agentId`. `agent-coder` is the only one today. |
 | **Agent Registry** | The map from `agentId` to everything needed to dispatch to that agent: Cloud Run Job name, region, bucket prefix, required task fields. A literal in `Config.ts` for v1. |
 | **Agent Job** | The Cloud Run Job *resource* backing an agent. Long-lived, deployed by the agent's own pipeline. The Dispatcher only ever executes it — it never creates or updates it. |
-| **Task** | A unit of work small enough for one unattended run. What the caller POSTs. |
+| **Task** | A unit of work small enough for one unattended run. What the caller POSTs. For `agent-coder`, one GitHub issue — the payload names the issue, never what to do with it. |
 | **Task File** | `task.json` in GCS, holding the task payload. Written once by the Dispatcher **before** triggering, immutable — the audit record of what was asked. Same object `agent-coder` §4.1 reads. |
 | **Task Record** | One Mongo document per task: the Dispatcher's own index. Maps `taskId` to its agent, its Cloud Run execution, and its last-known status. The only state this service owns. |
 | **Dispatch** | The act of writing a Task File and starting an execution for it. One POST = one dispatch = one execution. |
@@ -145,6 +155,15 @@ caller's body into the Task File verbatim, adding only the minted `taskId`. Step
 that the registry's `requiredTaskFields` are present and non-empty, and that is the whole
 extent of its interest in the payload: it does not know what `repoURL` means, and does not
 default `baseBranch`.
+
+**The payload names a target, never a behaviour.** This is the rule that makes a declared
+field list sufficient. `agent-coder` is an agent that implements GitHub issues — *that* is
+its behaviour, it lives in the image alongside the skills §3.5 of its own doc insists on
+baking in, and no field in the payload can change it. The payload says only *which* issue.
+A free-form prompt would break the rule: it lets any caller alter what the agent does, with
+no review gate and nothing in the record marking it as a behaviour change — the exact
+failure §3.5 rejects `latest` skills to avoid. Behaviour variation belongs in the Agent
+Registry (a different agent, a different job), not in a task field.
 
 **The bet this rests on:** agents differ only in their task schema, never in how they are
 launched. If that holds, `agent-reviewer` needs one registry row and zero lines of dispatch
@@ -233,7 +252,7 @@ export const AGENTS = {
         jobName: "agent-coder",              // Cloud Run Job resource
         region: "europe-west1",
         bucketPrefix: "coder",               // MUST equal AGENT_NAME in the container
-        requiredTaskFields: ["repoURL", "prompt"],
+        requiredTaskFields: ["repoURL", "issueURL"],
     },
 }
 ```
@@ -271,7 +290,7 @@ Collection: `tasks`. Unique index on `taskId`.
 | `agentId` | string | Registry key. What makes `GET /tasks/{taskId}` resolvable without an agent in the path. |
 | `status` | enum | See [§4.4](#44-status-enum). Stored, not computed — see [§3.2](#32-get-taskstaskid--what-happened-to-it). |
 | `taskFilePath` | string | Full `gs://…` path. Redundant (derivable from prefix + id) but cheap and unambiguous in a UI. |
-| `payload` | object | The caller's body, verbatim. Duplicates the Task File deliberately — a UI listing tasks needs prompts without N GCS reads, and the payload is immutable so the copies cannot drift. GCS remains the audit copy. |
+| `payload` | object | The caller's body, verbatim. Duplicates the Task File deliberately — a UI listing tasks needs the issue each one refers to without N GCS reads, and the payload is immutable so the copies cannot drift. GCS remains the audit copy. Note it carries an issue *URL*, not a title: a readable list needs GitHub, which OQ-10 keeps out of this service. |
 | `exitCode` | int \| null | If readable — see OQ-01. |
 | `error` | object \| null | Dispatch-time failure detail. Not agent failure detail. |
 | `createdAt` | date | Record insert time. Sort key, since `taskId` is not sortable. |
@@ -290,13 +309,20 @@ through a `TasksStore`.
 {
   "taskId": "5f3c1e7a-…",
   "repoURL": "https://github.com/nicolasances/agent-coder.git",
-  "prompt": "/implement feature described in https://github.com/…/issues/3",
+  "issueURL": "https://github.com/nicolasances/agent-coder/issues/3",
   "baseBranch": "main"
 }
 ```
 
 Everything except `taskId` is the caller's, untouched. `baseBranch` appears only if the
 caller sent it.
+
+**`repoURL` and `issueURL` are both explicit, and can therefore disagree** — an issue in
+one repo, a clone URL for another. Catching that is a string comparison of the two hosts and
+paths, no GitHub call needed, but it belongs in `agent-coder`'s `TaskSpec` and not here: the
+Dispatcher validates *presence* against `requiredTaskFields` and knows nothing about what
+either field means ([§3.1](#31-post-agentsagentidtasks--dispatch-a-task)). Teaching it to
+cross-check them would be the first crack in the pass-through design. See OQ-12.
 
 ### 4.4 Status enum
 
@@ -316,7 +342,7 @@ caller sent it.
 ```json
 {
   "repoURL": "https://github.com/nicolasances/agent-coder.git",
-  "prompt": "/implement feature described in https://github.com/…/issues/3",
+  "issueURL": "https://github.com/nicolasances/agent-coder/issues/3",
   "baseBranch": "main"
 }
 ```
@@ -340,7 +366,7 @@ caller sent it.
   "agentId": "agent-coder",
   "status": "succeeded",
   "exitCode": 0,
-  "payload": { "repoURL": "…", "prompt": "…", "baseBranch": "main" },
+  "payload": { "repoURL": "…", "issueURL": "…", "baseBranch": "main" },
   "createdAt": "2026-09-06T10:00:00Z",
   "endedAt": "2026-09-06T10:12:41Z"
 }
@@ -429,6 +455,8 @@ Per `AGENTS.md`, request/response interfaces are private to their delegate file:
 | OQ-09 | Should `agent-coder` read its prefix from an env var instead of hardcoding `AGENT_NAME`? | Would let `agentId` and `bucketPrefix` collapse into one field. Contradicts that repo's stated reasoning (the constant names *that repo*, not a deployment choice). Probably leave it; the registry absorbs the difference. |
 | OQ-10 | Does the Dispatcher validate anything about the repo — that it exists, that we can push to it? | No, in v1. It would need a GitHub token and would duplicate what `GitOps` already does. Consequence: a bad `repoURL` costs a container start. |
 | OQ-11 | With the execution name deliberately off the record ([§4.2](#42-taskrecord--the-mongo-document)), how is a task joined to its Cloud Run execution when refreshing status or cancelling? | Candidates: a label carrying the `taskId` set at dispatch; listing the job's executions and matching the `TASK_ID` override; or dropping the Cloud Run API as a status source once `agent-coder` writes `task-output.json` (OQ-01). **Verify against the Cloud Run Admin API v2 reference whether `run` accepts labels or a caller-chosen execution name** — do not assume. Blocks both refresh-on-read and a future cancel. |
+| OQ-12 | `repoURL` and `issueURL` can name different repositories. Who catches that? | A host/path comparison of the two, no GitHub call needed. Belongs in `agent-coder`'s `TaskSpec`, since the Dispatcher deliberately doesn't know what either field means ([§3.1](#31-post-agentsagentidtasks--dispatch-a-task)). Alternative: drop `repoURL` and derive it from `issueURL`, making the disagreement unrepresentable — rejected, `repoURL` stays explicit as the clone source. |
+| OQ-13 | Dropping `prompt` makes the audit record **mutable**: "what was asked" now lives in a GitHub issue anyone can edit after the run. | A regression against `agent-coder` §3.3's "written once, immutable — the audit record of what was asked". Candidates: the agent snapshots the issue body into `trace.json`/`RunResult` at read time; or it records the issue's `updated_at`/ETag so a later edit is at least detectable. Needs a deliberate answer in `agent-coder`, not silence. |
 
 ---
 
