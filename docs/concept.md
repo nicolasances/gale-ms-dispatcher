@@ -148,12 +148,18 @@ The one write operation. Six steps, and **the order is load-bearing**:
 4. write Task File to GCS   → gs://{GCP_PID}-agents-data/{bucketPrefix}/{taskId}/task.json
 5. insert Task Record       → status: "starting"
 6. trigger the execution    → TASK_ID={taskId} as a per-execution override
-7. update Task Record       → status: "running"
+7. update Task Record       → executionName (from the Operation), status: "running"
 ```
 
 **Why the Task File is written before the trigger.** `agent-coder` §4.1 is explicit: the
 container resolves `TASK_ID` against GCS the moment it starts. Trigger first and you race
 the container to its own input. The write is cheap and idempotent; the ordering is free.
+
+**Never wait for the job.** `jobs.run` returns a long-running `Operation`, and awaiting it
+(`operation.promise()` in `@google-cloud/run`) blocks until the *job* finishes — 5 to 30
+minutes. Step 6 fires the call and reads the execution's name off the returned operation
+without awaiting completion. This is the single easiest way to get this endpoint badly
+wrong.
 
 **Why the record is inserted before the trigger.** The alternative — trigger, then insert —
 has a window where a crash leaves a *running, billing, invisible* execution with no record.
@@ -199,6 +205,7 @@ Two consequences worth stating plainly:
 | Step 4 (GCS write) | Nothing started | `500`, safe to retry |
 | Step 6 (trigger) | Orphan Task File + record marked `failed_to_start` | `500`, safe to retry as a *new* task |
 | Between 5 and 6 (process dies) | Record stuck in `starting`, no execution ever started | Task appears permanently `starting` — a known wart, see OQ-07 |
+| Between 6 and 7 (process dies) | Execution **running**, record has no `executionName` | Task appears permanently `starting` while the agent actually works, and the execution can never be re-identified ([§3.2](#32-get-taskstaskid--what-happened-to-it)). The narrowest window here, and the most annoying one. |
 
 An orphan Task File costs nothing and is never garbage-collected. It is an immutable record
 of something that was asked and never ran, which is arguably worth keeping.
@@ -211,14 +218,21 @@ the run, and the value it will pass to `GET /tasks/{taskId}`.
 Read the Task Record. If its status is non-terminal, refresh it from the Cloud Run
 Executions API, persist the refreshed status, and return.
 
-**The record does not store the execution's name** *(revised — see OQ-11)*. It is a GCP
-implementation detail with no meaning to any caller, so it is deliberately absent from both
-the record and the response. The cost is that the join from `taskId` to execution has to be
-re-established on every refresh, and **how is unresolved**: labelling the execution with the
-`taskId` at dispatch, listing the job's executions and matching on the `TASK_ID` override,
-or abandoning the Cloud Run API entirely in favour of `agent-coder`'s own
-`task-output.json` once that exists. Whether Cloud Run's `run` call accepts a label or a
-caller-chosen execution name must be verified against its API reference, not assumed.
+**Dispatch is the only moment the execution can be identified, so step 7 must capture it**
+*(verified 2026-09-06 against the Cloud Run Admin API v2 reference)*. The `jobs.run` request
+body is only `validateOnly`, `etag` and `overrides` — and `overrides` carries just
+`containerOverrides[]` (`name`, `args`, `env`, `clearArgs`), `taskCount` and `timeout`.
+**There is no way to attach a label, an annotation or a caller-chosen name to an execution
+at dispatch**, and `executions.list` documents no filter parameter, so "find the execution
+whose `TASK_ID` is X" is not a query that exists. The name comes back from the `Operation`
+that `jobs.run` returns, and if the record does not keep it, the Cloud Run API becomes
+permanently unreachable for that task.
+
+It is kept internal for that reason alone — stored on the record ([§4.2](#42-taskrecord--the-mongo-document)),
+absent from the response ([§4.5](#45-api-shapes)). Callers get `status`, not GCP resource
+names. *(The documented fallback, `Job.latestCreatedExecution`, is a single
+`ExecutionReference` per job and so is unreliable the moment two tasks are dispatched close
+together — it is a debugging aid, not a substitute for recording the name.)*
 
 **What it can honestly say — and what it can't.** `agent-coder`'s exit code taxonomy (§4.5)
 exists to separate outcomes that demand opposite responses: `20` (the agent could not solve
@@ -310,6 +324,7 @@ Collection: `tasks`. Unique index on `taskId`.
 |---|---|---|
 | `taskId` | string | Minted by the Dispatcher. Also the GCS folder name and the `TASK_ID` override. |
 | `agentId` | string | Registry key. What makes `GET /tasks/{taskId}` resolvable without an agent in the path. |
+| `executionName` | string \| null | Cloud Run execution resource name, read off the `Operation` that `jobs.run` returns. **Stored but never returned** — it is a GCP detail no caller can use. `null` until step 7, and forever if the trigger failed. See [§3.2](#32-get-taskstaskid--what-happened-to-it) for why it cannot be recovered later if not captured here. |
 | `status` | enum | See [§4.4](#44-status-enum). Stored, not computed — see [§3.2](#32-get-taskstaskid--what-happened-to-it). |
 | `taskFilePath` | string | Full `gs://…` path. Redundant (derivable from prefix + id) but cheap and unambiguous in a UI. |
 | `payload` | object | The caller's body, verbatim. Duplicates the Task File deliberately — a UI listing tasks needs the issue each one refers to without N GCS reads, and the payload is immutable so the copies cannot drift. GCS remains the audit copy. Note it carries an issue *URL*, not a title: a readable list needs GitHub, which OQ-10 keeps out of this service. |
@@ -350,7 +365,7 @@ cross-check them would be the first crack in the pass-through design. See OQ-12.
 
 | Status | Meaning | Terminal |
 |---|---|---|
-| `starting` | Record inserted, execution requested or in flight. Not yet observed running. | No |
+| `starting` | Record inserted, execution requested or in flight. Not yet observed running, and `executionName` may not be set yet. | No |
 | `running` | Cloud Run reports the execution as running. | No |
 | `succeeded` | Execution completed successfully. Says nothing about whether the agent solved the task — see OQ-01. | Yes |
 | `failed` | Execution failed. Conflates "agent gave up" with "clone failed" until OQ-01 is resolved. | Yes |
@@ -466,17 +481,17 @@ Per `AGENTS.md`, request/response interfaces are private to their delegate file:
 
 | # | Question | Options / Notes |
 |---|---|---|
-| OQ-01 | Can the Dispatcher read a run's **exit code** from Cloud Run, or must it wait for `RunResult`? | **Verify against Google's Cloud Run Admin API v2 reference — do not assume.** Execution-level state is certain; a per-attempt exit code may live on a different resource. If unreadable: `exitCode` stays `null` and the `20`-vs-`30` distinction waits for `task-output.json`. Highest-value unknown in this doc. |
+| OQ-01 | Can the Dispatcher read a run's **exit code** from Cloud Run, or must it wait for `RunResult`? | Partly answered 2026-09-06: the `Execution` resource exposes only `runningCount` / `succeededCount` / `failedCount` / `cancelledCount` and `conditions` — **no per-task exit code**. So `succeeded`/`failed` are available and the `20`-vs-`30` distinction is not, at least at that level. Still to check: whether the `executions.tasks` sub-resource carries an attempt result with an exit code. If it does not, `exitCode` stays `null` until `agent-coder` writes `task-output.json`. |
 | OQ-02 | Refresh status on read, or have Cloud Run push state changes via Eventarc/Pub-Sub? | Pull for v1. Switch when a UI makes the N+1 hurt. The `evt/handlers/On{Event}.ts` convention and the `@google-cloud/pubsub` dependency already exist. Design `status` as a stored field either way. |
 | OQ-03 | What authenticates a caller? | Does `totoms`' `UserContext` already cover it? If so, drop `--allow-unauthenticated` from the pipeline and the question closes. If not, this needs an answer *before* the URL is shared with anything. |
 | OQ-04 | Accept an optional caller-supplied idempotency key? | `agent-coder` §4.4 already frames `taskId` as an idempotency key, so honouring a caller-supplied one is a small branch. Deferred, not rejected. |
 | OQ-05 | `taskId` format? | `crypto.randomUUID()` needs no dependency but isn't sortable — hence `createdAt` as the sort key. A ULID-style prefix would make ids sortable and greppable in GCS listings. Low stakes, hard to change later. |
-| OQ-06 | Service name and base path? | `src/index.ts` still says `serviceName: "toto-ms-ex1"`, `basePath: '/ex1'`. Needs a real value; `/dispatcher` reads well against `GALE_BROKER_URL`'s existing `/galebroker` convention. |
+| OQ-06 | ~~Service name and base path?~~ **Decided: `gale-ms-dispatcher`, basePath `/dispatcher`.** | Chosen 2026-09-06 to match the repo and the Cloud Run service name, and to read consistently with the existing `GALE_BROKER_URL` `/galebroker` convention. Effective paths are `/dispatcher/agents/{agentId}/tasks` and `/dispatcher/tasks/{taskId}`; §3 and §4.5 give them without the prefix for readability. |
 | OQ-07 | How is a record stuck in `starting` resolved, when no execution was ever created? | Nothing distinguishes it from a task whose execution simply hasn't been observed running yet, and with the execution name off the record (OQ-11) there is no direct handle to check. Options: a staleness rule (`starting` + older than N minutes ⇒ `failed_to_start`), or leave it and let it be visibly wrong. |
 | OQ-08 | `GET` on an unknown `taskId` — plain `404`, or check GCS first? | A `404` is honest and cheap. Checking GCS would find tasks dispatched outside this service, which arguably shouldn't exist. Lean `404`. |
 | OQ-09 | Should `agent-coder` read its prefix from an env var instead of hardcoding `AGENT_NAME`? | Would let `agentId` and `bucketPrefix` collapse into one field. Contradicts that repo's stated reasoning (the constant names *that repo*, not a deployment choice). Probably leave it; the registry absorbs the difference. |
 | OQ-10 | Does the Dispatcher validate anything about the repo — that it exists, that we can push to it? | No, in v1. It would need a GitHub token and would duplicate what `GitOps` already does. Consequence: a bad `repoURL` costs a container start. |
-| OQ-11 | With the execution name deliberately off the record ([§4.2](#42-taskrecord--the-mongo-document)), how is a task joined to its Cloud Run execution when refreshing status or cancelling? | Candidates: a label carrying the `taskId` set at dispatch; listing the job's executions and matching the `TASK_ID` override; or dropping the Cloud Run API as a status source once `agent-coder` writes `task-output.json` (OQ-01). **Verify against the Cloud Run Admin API v2 reference whether `run` accepts labels or a caller-chosen execution name** — do not assume. Blocks both refresh-on-read and a future cancel. |
+| OQ-11 | ~~With the execution name deliberately off the record, how is a task joined to its Cloud Run execution?~~ **Answered: it is on the record, captured at dispatch.** | Verified 2026-09-06: `jobs.run` accepts no label, annotation or caller-chosen execution name, and `executions.list` documents no filter, so both alternatives (label-and-query, list-and-match) are impossible rather than merely awkward. The `Operation` returned by `jobs.run` is the only source. Kept internal to the record — see [§3.2](#32-get-taskstaskid--what-happened-to-it). |
 | OQ-12 | ~~`repoURL` and `issueURL` can name different repositories. Who catches that?~~ **Answered by `agent-coder` #5: nobody, by decision.** | #5 puts both URL-shape validation and the owner/repo consistency check explicitly out of scope, on the grounds that a mismatch self-diagnoses — "the agent clones repo A and cannot find the issue." Sound, with one cost worth recording: that self-diagnosis happens *after* a container start, and since #5 also leaves the exit code taxonomy untouched for malformed Task Files, it likely reports as `20` (agent failed) rather than as bad input. So `GET /tasks/{taskId}` will show a contradictory task as an agent failure. Cheap to revisit later — it is a host/path string comparison, no GitHub call. |
 | OQ-13 | With the agent opening the PR (`agent-coder` #5), how does `RunResult.pr_url` get populated — and therefore how does this service ever report a PR link? | The runner no longer creates the PR, so it no longer knows its URL. Recoverable but no longer free: parse it from the agent's stdout/`trace.json`, or query GitHub for the head branch after the run. `commit_shas`, `base_sha` and the branch name stay readable from the clone, so this is specifically a PR-URL problem. Blocks the most user-visible item in [§9](#9-ideas-for-future-versions). |
 | OQ-14 | With git operations inside the agent turn (`agent-coder` #5), can `20` (agent failed) still be told from `30` (infra failed)? | The distinction `agent-coder` §4.5 exists to preserve, and the most valuable thing [§3.2](#32-get-taskstaskid--what-happened-to-it) could report. Explicitly not considered in #5's implementation; to be revisited. Candidates: the agent's skills exit with a distinct code when push/PR fails rather than when the task defeats them; the runner re-verifies post-conditions after the agent turn (was a branch pushed? does a PR exist?) and classifies from that; or git returns to the runner as §3.1 originally argued — which is why #5 keeps `GitOps` rather than deleting it. **The post-condition check would answer OQ-13 in the same pass**, since finding the PR is how you verify it exists. |
