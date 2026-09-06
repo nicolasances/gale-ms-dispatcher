@@ -89,7 +89,7 @@ Three callers, in the order they arrive:
   own. `agent-coder`'s exit code taxonomy (§4.5) exists so the *caller* can make those
   decisions.
 - **Cancelling a run** — deliberately deferred, see [§8](#8-not-doing-and-why).
-- **Logs, traces, `RunResult` subpaths, streaming progress** — see [§3.5](#35-what-the-status-endpoint-can-honestly-say) for why these are gated on `agent-coder`, not on us.
+- **Logs, traces, `RunResult` subpaths, streaming progress** — see [§3.4](#34-what-the-status-endpoint-can-honestly-say) for why these are gated on `agent-coder`, not on us.
 - **Listing tasks.** The UI caller will want it; v1 does not have it (see [§9](#9-ideas-for-future-versions)).
 - **Concurrency caps and budget enforcement.** Discussed, rejected for v1, consequences written down in [§8](#8-not-doing-and-why).
 - **Any runtime other than Cloud Run Jobs.** No GKE seam.
@@ -139,6 +139,27 @@ the container to its own input. The write is cheap and idempotent; the ordering 
 has a window where a crash leaves a *running, billing, invisible* execution with no record.
 Inserting first inverts the failure: a crash leaves a record with no execution, which is
 visible and harmless. That is the right way round.
+
+**Design decision — step 4 writes the payload through, untyped.** The Dispatcher copies the
+caller's body into the Task File verbatim, adding only the minted `taskId`. Step 2 checks
+that the registry's `requiredTaskFields` are present and non-empty, and that is the whole
+extent of its interest in the payload: it does not know what `repoURL` means, and does not
+default `baseBranch`.
+
+**The bet this rests on:** agents differ only in their task schema, never in how they are
+launched. If that holds, `agent-reviewer` needs one registry row and zero lines of dispatch
+code. If it breaks — an agent that needs a GKE Job rather than a Cloud Run Job — the
+registry gains a runtime field and this service gains a second seam. Named in
+[§6](#6-constraints--assumptions), and accepted.
+
+Two consequences worth stating plainly:
+
+- **Defaults belong to the agent, not to us.** `agent-coder` defaults `baseBranch` to
+  `main` in `TaskSpec.from_dict()`. Duplicating that default here would create two places
+  for it to drift. So we don't.
+- **A typo in an optional field is not caught.** `basebranch` instead of `baseBranch` sails
+  through and silently gets `agent-coder`'s default. Only *required* fields are checked.
+  That is the price of the generic dispatcher, and it is the right price for now.
 
 **Failure modes, stated rather than discovered:**
 
@@ -198,33 +219,12 @@ public identifier this service exposes is `agent-coder`. Rather than forcing eit
 rename, the registry holds both and makes the seam explicit. If the two are ever unified
 (see OQ-10), this becomes one field and nothing else changes.
 
-`requiredTaskFields` is what turns pass-through into something safer than a shrug — see
-[§3.4](#34-the-task-payload-is-passed-through).
+`requiredTaskFields` is what turns the pass-through of [§3.1](#31-post-agentsagentidtasks--dispatch-a-task) into something safer
+than a shrug.
 
-### 3.4 The task payload is passed through
+### 3.4 What the status endpoint can honestly say
 
-The Dispatcher writes the caller's body to the Task File **verbatim**, adding only the
-minted `taskId`. It validates that `requiredTaskFields` are present and non-empty. It does
-not know what `repoURL` means, does not default `baseBranch`, does not type the payload.
-
-**The bet:** agents differ only in their task schema, never in how they are launched. If
-that holds, `agent-reviewer` needs one registry row and zero lines of dispatch code. If it
-breaks — an agent that needs a GKE Job rather than a Cloud Run Job — the registry gains a
-runtime field and this service gains a second seam. That is a real risk, named in
-[§6](#6-constraints--assumptions), and accepted.
-
-Two consequences worth stating plainly:
-
-- **Defaults belong to the agent, not to us.** `agent-coder` defaults `baseBranch` to
-  `main` in `TaskSpec.from_dict()`. Duplicating that default here would create two places
-  for it to drift. So we don't.
-- **A typo in an optional field is not caught.** `basebranch` instead of `baseBranch` sails
-  through and silently gets `agent-coder`'s default. Only *required* fields are checked.
-  That is the price of the generic dispatcher, and it is the right price for now.
-
-### 3.5 What the status endpoint can honestly say
-
-This is the part of the design most likely to disappoint, so it gets its own section.
+This is the part of the design most likely to disappoint, so it gets said out loud.
 
 `agent-coder`'s exit code taxonomy (§4.5) exists to separate outcomes that demand opposite
 responses: `20` (the agent could not solve it — do not retry) versus `30` (infra failed —
@@ -380,7 +380,7 @@ Per `AGENTS.md`, request/response interfaces are private to their delegate file:
   DR's Kubernetes Jobs (`agent-coder` §3.2's runtime table). Would force a runtime seam in
   the registry.
 - **Agents differ only by task payload, not by launch mechanism.** The whole
-  pass-through-plus-registry design rests on this. See [§3.4](#34-the-task-payload-is-passed-through).
+  pass-through-plus-registry design rests on this. See [§3.1](#31-post-agentsagentidtasks--dispatch-a-task).
 - **One execution per task; a retry is a new task with a new id.** Consequence: three
   attempts at the same intent are three unrelated records in three GCS folders, with
   nothing linking them. `agent-coder`'s own OQ-12 admits the sibling version of this
@@ -458,7 +458,7 @@ Per `AGENTS.md`, request/response interfaces are private to their delegate file:
   new agent would become a code change, defeating the registry. `requiredTaskFields` is the
   compromise.
 - **`/logs`, `/trace`, `RunResult` subpaths** — gated on `agent-coder`, not on us. `trace.json`
-  only exists after the run ends; `task-output.json` doesn't exist at all yet. See [§3.5](#35-what-the-status-endpoint-can-honestly-say).
+  only exists after the run ends; `task-output.json` doesn't exist at all yet. See [§3.4](#34-what-the-status-endpoint-can-honestly-say).
 - **Streaming progress (SSE/websocket)** — needs `agent-coder`'s `AgentEvent`/`EventSink`
   (its §3.4), which is unbuilt. We'd be building both halves of a protocol at once.
 - **Listing tasks** — the UI caller needs it and v1 doesn't have it. Called out honestly
@@ -497,7 +497,7 @@ Per `AGENTS.md`, request/response interfaces are private to their delegate file:
 - **Task → runs** — a `runs[]` array and a re-dispatch endpoint, if grouping attempts turns
   out to matter.
 - **A second agent** — the real test of the registry. Until `agent-reviewer` or similar
-  exists, §3.4's bet is untested.
+  exists, §3.1's bet is untested.
 - **A runtime field in the registry** — `cloudrun` \| `gke`, the day DR needs it.
 
 ---
