@@ -570,17 +570,22 @@ Per `AGENTS.md`, request/response interfaces are private to their delegate file:
 
 ## Appendix A — Current repo state vs. target
 
-**Nothing in this document is implemented.** The repo is an unmodified `toto-node-template`:
+**The dispatch path is implemented; the read path and all of the infrastructure are not.**
+Issue [#1](https://github.com/nicolasances/gale-ms-dispatcher/issues/1) delivered
+[§3.1](#31-post-agentsagentidtasks--dispatch-a-task) and
+[§3.3](#33-the-agent-registry) in full. Everything below marked ❌ is still open.
 
 | Area | Today | Target |
 |---|---|---|
-| `src/index.ts` | `serviceName: "toto-ms-ex1"`, `basePath: '/ex1'`, one `GET /hello` wired to `SayHello` | Real service name and base path; `POST /agents/:agentId/tasks` and `GET /tasks/:taskId` |
-| `src/dlg/` | `ExampleDelegate.ts` (`SayHello`) | `PostAgentTask.ts`, `GetTask.ts` |
-| `src/Config.ts` | `getMongoSecretNames()` returns `null`; `getProps()` returns `{}` | Mongo secrets wired; `AGENTS` registry literal |
-| `src/store/` | Does not exist | `TasksStore.ts` |
-| `src/model/` | Does not exist | `TaskRecord.ts` (+ `fromBSON`/`toBSON`) |
-| Cloud Run client | Not a dependency | `@google-cloud/run`, or REST via the existing `google-auth-library` |
-| `package.json` | `name: "toto-node-template"` | `gale-ms-dispatcher` |
-| `gcp/terraform/` | Template boilerplate, `toto-ms-xxx` placeholders, no Cloud Run job permissions | Real service account with permission to execute jobs and read execution state |
-| `gcp/.github/workflows/` | Entirely commented out; `--allow-unauthenticated` | Live pipeline; auth decision resolved (OQ-03) |
-| Tests | None | Registry resolution, required-field validation, dispatch ordering |
+| `src/index.ts` | ✅ `serviceName: "gale-ms-dispatcher"`, `basePath: '/dispatcher'`, `POST /agents/:agentId/tasks` wired | Also `GET /tasks/:taskId` |
+| `src/dlg/` | ✅ `PostAgentTask.ts` | Also `GetTask.ts` |
+| `src/Config.ts` | ✅ `AGENTS` registry literal, Mongo secret names, `getAgentsDataBucket()` | — |
+| `src/model/` | ✅ `Agent.ts`, `AgentRegistry.ts`, `TaskRecord.ts` (+ `fromBSON`/`toBSON`), `TaskFile.ts` | — |
+| `src/store/` | ✅ `TasksStore.ts` — save, update execution, update status, find by id | — |
+| `src/api/` | ✅ `AgentsDataBucketAPI.ts` (GCS), `CloudRunJobsAPI.ts` (job execution) | — |
+| Cloud Run client | ✅ `@google-cloud/run` | — |
+| `package.json` | ✅ `name: "gale-ms-dispatcher"` | — |
+| Tests | ✅ Mocha under `test/`, mirroring `src/`. 32 tests: registry resolution, required-field validation, Task File composition, `TaskRecord` round-trip, job-request composition, path building | The dispatch happy path is not unit tested — it writes to GCS and Mongo, and the standards forbid tests needing a live database. Verified by hand instead. |
+| Status refresh | ❌ Nothing moves a task past `running` | `GET /tasks/:taskId`, blocked on OQ-01 |
+| `gcp/terraform/` | ❌ Template boilerplate, `toto-ms-xxx` placeholders, no Cloud Run job permissions | Real service account with permission to execute jobs and read execution state; the agents-data bucket and the Mongo secrets |
+| `gcp/.github/workflows/` | ❌ Entirely commented out; `--allow-unauthenticated` | Live pipeline; auth decision resolved (OQ-03) |
