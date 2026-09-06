@@ -128,7 +128,7 @@ The one write operation. Six steps, and **the order is load-bearing**:
 4. write Task File to GCS   → gs://{GCP_PID}-agents-data/{bucketPrefix}/{taskId}/task.json
 5. insert Task Record       → status: "starting"
 6. trigger the execution    → TASK_ID={taskId} as a per-execution override
-7. update Task Record       → executionName, status: "running"
+7. update Task Record       → status: "running"
 ```
 
 **Why the Task File is written before the trigger.** `agent-coder` §4.1 is explicit: the
@@ -169,7 +169,7 @@ Two consequences worth stating plainly:
 | Step 2 | Nothing happened | `400` + the missing field names |
 | Step 4 (GCS write) | Nothing started | `500`, safe to retry |
 | Step 6 (trigger) | Orphan Task File + record marked `failed_to_start` | `500`, safe to retry as a *new* task |
-| Between 5 and 6 (process dies) | Record stuck in `starting` with no `executionName` | Task appears permanently `starting` — a known wart, see OQ-07 |
+| Between 5 and 6 (process dies) | Record stuck in `starting`, no execution ever started | Task appears permanently `starting` — a known wart, see OQ-07 |
 
 An orphan Task File costs nothing and is never garbage-collected. It is an immutable record
 of something that was asked and never ran, which is arguably worth keeping.
@@ -181,6 +181,15 @@ the run, and the value it will pass to `GET /tasks/{taskId}`.
 
 Read the Task Record. If its status is non-terminal, refresh it from the Cloud Run
 Executions API, persist the refreshed status, and return.
+
+**The record does not store the execution's name** *(revised — see OQ-11)*. It is a GCP
+implementation detail with no meaning to any caller, so it is deliberately absent from both
+the record and the response. The cost is that the join from `taskId` to execution has to be
+re-established on every refresh, and **how is unresolved**: labelling the execution with the
+`taskId` at dispatch, listing the job's executions and matching on the `TASK_ID` override,
+or abandoning the Cloud Run API entirely in favour of `agent-coder`'s own
+`task-output.json` once that exists. Whether Cloud Run's `run` call accepts a label or a
+caller-chosen execution name must be verified against its API reference, not assumed.
 
 **What it can honestly say — and what it can't.** `agent-coder`'s exit code taxonomy (§4.5)
 exists to separate outcomes that demand opposite responses: `20` (the agent could not solve
@@ -261,7 +270,6 @@ Collection: `tasks`. Unique index on `taskId`.
 | `taskId` | string | Minted by the Dispatcher. Also the GCS folder name and the `TASK_ID` override. |
 | `agentId` | string | Registry key. What makes `GET /tasks/{taskId}` resolvable without an agent in the path. |
 | `status` | enum | See [§4.4](#44-status-enum). Stored, not computed — see [§3.2](#32-get-taskstaskid--what-happened-to-it). |
-| `executionName` | string \| null | Cloud Run execution resource name. `null` until step 7, and forever if the trigger failed. |
 | `taskFilePath` | string | Full `gs://…` path. Redundant (derivable from prefix + id) but cheap and unambiguous in a UI. |
 | `payload` | object | The caller's body, verbatim. Duplicates the Task File deliberately — a UI listing tasks needs prompts without N GCS reads, and the payload is immutable so the copies cannot drift. GCS remains the audit copy. |
 | `exitCode` | int \| null | If readable — see OQ-01. |
@@ -294,7 +302,7 @@ caller sent it.
 
 | Status | Meaning | Terminal |
 |---|---|---|
-| `starting` | Record inserted, execution requested or in flight. No `executionName` yet. | No |
+| `starting` | Record inserted, execution requested or in flight. Not yet observed running. | No |
 | `running` | Cloud Run reports the execution as running. | No |
 | `succeeded` | Execution completed successfully. Says nothing about whether the agent solved the task — see OQ-01. | Yes |
 | `failed` | Execution failed. Conflates "agent gave up" with "clone failed" until OQ-01 is resolved. | Yes |
@@ -332,7 +340,6 @@ caller sent it.
   "agentId": "agent-coder",
   "status": "succeeded",
   "exitCode": 0,
-  "executionName": "…/executions/agent-coder-abc12",
   "payload": { "repoURL": "…", "prompt": "…", "baseBranch": "main" },
   "createdAt": "2026-09-06T10:00:00Z",
   "endedAt": "2026-09-06T10:12:41Z"
@@ -417,10 +424,11 @@ Per `AGENTS.md`, request/response interfaces are private to their delegate file:
 | OQ-04 | Accept an optional caller-supplied idempotency key? | `agent-coder` §4.4 already frames `taskId` as an idempotency key, so honouring a caller-supplied one is a small branch. Deferred, not rejected. |
 | OQ-05 | `taskId` format? | `crypto.randomUUID()` needs no dependency but isn't sortable — hence `createdAt` as the sort key. A ULID-style prefix would make ids sortable and greppable in GCS listings. Low stakes, hard to change later. |
 | OQ-06 | Service name and base path? | `src/index.ts` still says `serviceName: "toto-ms-ex1"`, `basePath: '/ex1'`. Needs a real value; `/dispatcher` reads well against `GALE_BROKER_URL`'s existing `/galebroker` convention. |
-| OQ-07 | How is a record stuck in `starting` with no `executionName` resolved? | It cannot be refreshed — there's nothing to query. Options: a staleness rule (`starting` + older than N minutes ⇒ `failed_to_start`), or leave it and let it be visibly wrong. |
+| OQ-07 | How is a record stuck in `starting` resolved, when no execution was ever created? | Nothing distinguishes it from a task whose execution simply hasn't been observed running yet, and with the execution name off the record (OQ-11) there is no direct handle to check. Options: a staleness rule (`starting` + older than N minutes ⇒ `failed_to_start`), or leave it and let it be visibly wrong. |
 | OQ-08 | `GET` on an unknown `taskId` — plain `404`, or check GCS first? | A `404` is honest and cheap. Checking GCS would find tasks dispatched outside this service, which arguably shouldn't exist. Lean `404`. |
 | OQ-09 | Should `agent-coder` read its prefix from an env var instead of hardcoding `AGENT_NAME`? | Would let `agentId` and `bucketPrefix` collapse into one field. Contradicts that repo's stated reasoning (the constant names *that repo*, not a deployment choice). Probably leave it; the registry absorbs the difference. |
 | OQ-10 | Does the Dispatcher validate anything about the repo — that it exists, that we can push to it? | No, in v1. It would need a GitHub token and would duplicate what `GitOps` already does. Consequence: a bad `repoURL` costs a container start. |
+| OQ-11 | With the execution name deliberately off the record ([§4.2](#42-taskrecord--the-mongo-document)), how is a task joined to its Cloud Run execution when refreshing status or cancelling? | Candidates: a label carrying the `taskId` set at dispatch; listing the job's executions and matching the `TASK_ID` override; or dropping the Cloud Run API as a status source once `agent-coder` writes `task-output.json` (OQ-01). **Verify against the Cloud Run Admin API v2 reference whether `run` accepts labels or a caller-chosen execution name** — do not assume. Blocks both refresh-on-read and a future cancel. |
 
 ---
 
@@ -429,8 +437,9 @@ Per `AGENTS.md`, request/response interfaces are private to their delegate file:
 - **Cancel (`DELETE /tasks/{taskId}`)** — deferred by decision. One Cloud Run API call, and
   it satisfies `agent-coder`'s US-05 ("cancel a runaway run"). **Stated consequence:** v1
   lets you watch a looping agent burn tokens and gives you no API to stop it — the escape
-  hatch is `gcloud` or the console. Since `executionName` is already on the record, this is
-  the cheapest thing in [§9](#9-ideas-for-future-versions) to add later.
+  hatch is `gcloud` or the console. Note that it now shares a prerequisite with the status
+  refresh itself: without the execution's name on the record, cancelling first requires
+  finding the execution (OQ-11).
 - **Task → many runs history** — one execution per task, a retry is a new task. Simpler
   records, and no ambiguity about which execution a status refers to. The cost is no
   grouping of attempts at the same intent, and this is the decision most expensive to
@@ -470,8 +479,8 @@ Per `AGENTS.md`, request/response interfaces are private to their delegate file:
 
 ## 9. Ideas for Future Versions
 
-- **Cancel** — `DELETE /tasks/{taskId}`. Cheapest high-value addition; `executionName` is
-  already recorded.
+- **Cancel** — `DELETE /tasks/{taskId}`. High-value and small, once OQ-11 settles how a
+  task's execution is located.
 - **`GET /agents/{agentId}/tasks`** — paginated listing, sorted by `createdAt`. The thing the
   UI needs first.
 - **`GET /agents`** — expose the registry, so a UI can populate a dropdown and discover
