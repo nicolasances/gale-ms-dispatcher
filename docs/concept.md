@@ -5,14 +5,22 @@
 > [Appendix A](#appendix-a--current-repo-state-vs-target) for exactly what exists today.
 > Last revised: 2026-09-06.
 >
-> **Depends on a change not yet made in `agent-coder`.** §4.3's Task File drops the
-> free-form `prompt` field in favour of an `issueURL`, on the reasoning in
+> **Depends on `agent-coder` issue
+> [#5](https://github.com/nicolasances/agent-coder/issues/5), in implementation as of
+> 2026-09-06.** §4.3's Task File drops the free-form `prompt` field in favour of an
+> `issueURL`, on the reasoning in
 > [§3.1](#31-post-agentsagentidtasks--dispatch-a-task) ("the payload names a target, never a
-> behaviour"). `agent-coder`'s `TaskSpec` still requires `prompt` today
-> (`runner/model/task.py`). Until that changes, the shapes in §4.3 and §4.5 describe the
-> intended contract, not the current one. Worth recording what it buys there: that repo's
-> OQ-11 (derive the branch name from the prompt — plain slug, or a summarisation call?)
-> disappears, since `issue-{n}` is derivable without a model in the loop.
+> behaviour"). Until that issue lands, `agent-coder`'s `TaskSpec` still requires `prompt`
+> (`runner/model/task.py`) and the shapes in §4.3 and §4.5 describe the intended contract,
+> not the current one. The field names, casing and required set below have been checked
+> against #5 and match it.
+>
+> **What #5 does *not* do, contrary to an earlier draft of this note:** it does not make
+> branch naming deterministic. It resolves that repo's OQ-11 by giving branch creation —
+> along with commit, push and PR — to the *agent*, via its `prepare` and `build-and-ship`
+> skills, reversing §3.1's "the runner owns the git operations, not the agent." That
+> reversal has consequences for what this service can report; see
+> [§3.2](#32-get-taskstaskid--what-happened-to-it) and OQ-01.
 >
 > This document deliberately borrows its vocabulary from
 > [`agent-coder/docs/concept.md`](https://github.com/nicolasances/agent-coder/blob/main/docs/concept.md)
@@ -81,10 +89,12 @@ Three callers, in the order they arrive:
   GCS folder name, and the `TASK_ID` execution override are the same value by convention
   only (`agent-coder` §4.1, §4.4). Getting one wrong produces a container that starts and
   then can't find its work.
-- **The agent's own validation is thinner than its needs.** `TaskSpec.from_dict()` checks
-  only two fields, then indexes the rest of the dict directly — so a Task File missing
-  `repoURL` fails with a `KeyError` inside the container instead of a `400` at the API
-  boundary. Validating against a declared field list is cheaper here than there.
+- **Validation after a container start is validation too late.** `agent-coder` #5 fixes its
+  own field checking (today `TaskSpec.from_dict()` validates two fields and then indexes
+  `repoURL` unguarded, raising `KeyError`), but even fixed, it can only reject a bad Task
+  File *after* an execution has been scheduled and a container has pulled and booted. The
+  same check against a declared field list costs a `400` here. The duplication is
+  deliberate: the agent must still validate, because a Task File can be written by hand.
 - **"What happened to that run?" has no answer outside the GCP console.** No id you can
   hand to a UI, no record that survives Cloud Run's execution retention.
 - **The `agentId → job → bucket prefix` mapping is written down nowhere.** `agent-coder`
@@ -225,6 +235,18 @@ readable and `null` otherwise. The full-fidelity answer arrives when `agent-code
 implements `RunResult` / `task-output.json` (its §4.3, **not built yet**), at which point
 this endpoint reads one GCS object and reports `status`, `prUrl`, `tokenUsage` and the rest
 properly. That is the real plan; Cloud Run's execution state is the stopgap.
+
+**A caveat that arrived with `agent-coder` #5, and it cuts against the above.** That issue
+moves branch creation, commit, push and PR out of the runner and into the agent's skills.
+`agent-coder` §3.1 rejected exactly that arrangement on the grounds of *failure
+attribution*: "'The agent could not solve the task' and 'the push was rejected' are
+different outcomes with different retry semantics. Merging them into one opaque agent turn
+destroys that distinction." That distinction is `20` versus `30` — the thing this endpoint
+most wants to report. With git inside the agent turn, a rejected push is liable to surface
+as an agent failure, so **`exitCode` may become less informative than the taxonomy
+suggests, even after `RunResult` exists.** Not this service's decision to make, and #5 does
+not address it — deliberately, it will be looked at later. Tracked as OQ-14, because it caps
+what this endpoint can ever promise.
 
 **Refresh-on-read, not pushed.** The alternative is to have Cloud Run execution state
 changes arrive via Eventarc/Pub-Sub and update records asynchronously, making `GET` a pure
@@ -455,8 +477,9 @@ Per `AGENTS.md`, request/response interfaces are private to their delegate file:
 | OQ-09 | Should `agent-coder` read its prefix from an env var instead of hardcoding `AGENT_NAME`? | Would let `agentId` and `bucketPrefix` collapse into one field. Contradicts that repo's stated reasoning (the constant names *that repo*, not a deployment choice). Probably leave it; the registry absorbs the difference. |
 | OQ-10 | Does the Dispatcher validate anything about the repo — that it exists, that we can push to it? | No, in v1. It would need a GitHub token and would duplicate what `GitOps` already does. Consequence: a bad `repoURL` costs a container start. |
 | OQ-11 | With the execution name deliberately off the record ([§4.2](#42-taskrecord--the-mongo-document)), how is a task joined to its Cloud Run execution when refreshing status or cancelling? | Candidates: a label carrying the `taskId` set at dispatch; listing the job's executions and matching the `TASK_ID` override; or dropping the Cloud Run API as a status source once `agent-coder` writes `task-output.json` (OQ-01). **Verify against the Cloud Run Admin API v2 reference whether `run` accepts labels or a caller-chosen execution name** — do not assume. Blocks both refresh-on-read and a future cancel. |
-| OQ-12 | `repoURL` and `issueURL` can name different repositories. Who catches that? | A host/path comparison of the two, no GitHub call needed. Belongs in `agent-coder`'s `TaskSpec`, since the Dispatcher deliberately doesn't know what either field means ([§3.1](#31-post-agentsagentidtasks--dispatch-a-task)). Alternative: drop `repoURL` and derive it from `issueURL`, making the disagreement unrepresentable — rejected, `repoURL` stays explicit as the clone source. |
-| OQ-13 | Dropping `prompt` makes the audit record **mutable**: "what was asked" now lives in a GitHub issue anyone can edit after the run. | A regression against `agent-coder` §3.3's "written once, immutable — the audit record of what was asked". Candidates: the agent snapshots the issue body into `trace.json`/`RunResult` at read time; or it records the issue's `updated_at`/ETag so a later edit is at least detectable. Needs a deliberate answer in `agent-coder`, not silence. |
+| OQ-12 | ~~`repoURL` and `issueURL` can name different repositories. Who catches that?~~ **Answered by `agent-coder` #5: nobody, by decision.** | #5 puts both URL-shape validation and the owner/repo consistency check explicitly out of scope, on the grounds that a mismatch self-diagnoses — "the agent clones repo A and cannot find the issue." Sound, with one cost worth recording: that self-diagnosis happens *after* a container start, and since #5 also leaves the exit code taxonomy untouched for malformed Task Files, it likely reports as `20` (agent failed) rather than as bad input. So `GET /tasks/{taskId}` will show a contradictory task as an agent failure. Cheap to revisit later — it is a host/path string comparison, no GitHub call. |
+| OQ-13 | With the agent opening the PR (`agent-coder` #5), how does `RunResult.pr_url` get populated — and therefore how does this service ever report a PR link? | The runner no longer creates the PR, so it no longer knows its URL. Recoverable but no longer free: parse it from the agent's stdout/`trace.json`, or query GitHub for the head branch after the run. `commit_shas`, `base_sha` and the branch name stay readable from the clone, so this is specifically a PR-URL problem. Blocks the most user-visible item in [§9](#9-ideas-for-future-versions). |
+| OQ-14 | With git operations inside the agent turn (`agent-coder` #5), can `20` (agent failed) still be told from `30` (infra failed)? | The distinction `agent-coder` §4.5 exists to preserve, and the most valuable thing [§3.2](#32-get-taskstaskid--what-happened-to-it) could report. Explicitly not considered in #5's implementation; to be revisited. Candidates: the agent's skills exit with a distinct code when push/PR fails rather than when the task defeats them; the runner re-verifies post-conditions after the agent turn (was a branch pushed? does a PR exist?) and classifies from that; or git returns to the runner as §3.1 originally argued — which is why #5 keeps `GitOps` rather than deleting it. **The post-condition check would answer OQ-13 in the same pass**, since finding the PR is how you verify it exists. |
 
 ---
 
@@ -515,7 +538,8 @@ Per `AGENTS.md`, request/response interfaces are private to their delegate file:
   `requiredTaskFields` rather than hardcoding a form.
 - **Read `RunResult`** — once `agent-coder` writes `task-output.json`, fold `status`,
   `prUrl`, `commitShas`, `tokenUsage` and `durationSeconds` into the `GET` response. This is
-  what makes the endpoint genuinely useful.
+  what makes the endpoint genuinely useful. `prUrl` specifically depends on OQ-13 being
+  answered on the agent side first.
 - **Pushed status via Eventarc** — `OnExecutionStateChange` handler updating records, making
   `GET` a pure Mongo read (OQ-02).
 - **Concurrency cap / budget** — max non-terminal runs per agent, `429` past the limit. Add
