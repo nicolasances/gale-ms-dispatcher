@@ -85,3 +85,23 @@ describe('Agent.taskFileGsPath', () => {
     })
 
 })
+
+describe('Agent.jobResourceName', () => {
+
+    it('builds the fully qualified Cloud Run Job resource name', () => {
+
+        const agent = coderAgent({ requiredTaskFields: [] });
+
+        assert.strictEqual(agent.jobResourceName({ projectId: "totoexperiments" }), "projects/totoexperiments/locations/europe-west1/jobs/agent-coder");
+
+    })
+
+    it("uses the agent's own region, not the service's", () => {
+
+        const agent = new Agent({ agentId: "agent-coder", jobName: "agent-coder", region: "us-central1", bucketPrefix: "coder", requiredTaskFields: [] });
+
+        assert.ok(agent.jobResourceName({ projectId: "totoexperiments" }).includes("/locations/us-central1/"));
+
+    })
+
+})

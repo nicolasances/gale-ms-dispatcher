@@ -2,7 +2,9 @@ import { Request } from "express";
 import { randomUUID } from "crypto";
 import { TotoDelegate, UserContext, ValidationError } from "totoms";
 import { ControllerConfig } from "../Config";
+import { Agent } from "../model/Agent";
 import { AgentsDataBucketAPI } from "../api/AgentsDataBucketAPI";
+import { CloudRunJobsAPI } from "../api/CloudRunJobsAPI";
 import { TaskRecord } from "../model/TaskRecord";
 import { TasksStore } from "../store/TasksStore";
 
@@ -16,11 +18,10 @@ import { TasksStore } from "../store/TasksStore";
  *   3. mint taskId
  *   4. write Task File to GCS   → before the trigger, so the container cannot outrun its own input
  *   5. insert Task Record       → before the trigger, so a crash never leaves a billing, invisible execution
- *   6. trigger the execution    → task 3 of issue #1
- *   7. record the execution     → task 3 of issue #1
+ *   6. trigger the execution    → TASK_ID={taskId} as a per-execution override
+ *   7. update Task Record       → executionName, status: "running"
  *
- * Steps 6 and 7 are not implemented yet, so a dispatched task stays in the `starting` status and no agent
- * actually runs.
+ * Nothing moves the status past `running`: refreshing it is GET /tasks/{taskId}'s job, which does not exist yet.
  */
 export class PostAgentTask extends TotoDelegate<PostAgentTaskRequest, PostAgentTaskResponse> {
 
@@ -38,9 +39,46 @@ export class PostAgentTask extends TotoDelegate<PostAgentTaskRequest, PostAgentT
 
         const db = await config.getMongoDb(config.getDBName());
 
-        await new TasksStore({ db: db, config: config }).saveTask(TaskRecord.dispatching({ taskId: taskId, agentId: agent.agentId, taskFilePath: taskFilePath, payload: req.payload }));
+        const store = new TasksStore({ db: db, config: config });
 
-        return { taskId: taskId, agentId: agent.agentId, status: "starting", taskFile: taskFilePath };
+        await store.saveTask(TaskRecord.dispatching({ taskId: taskId, agentId: agent.agentId, taskFilePath: taskFilePath, payload: req.payload }));
+
+        await this.triggerExecution({ agent: agent, taskId: taskId, store: store });
+
+        return { taskId: taskId, agentId: agent.agentId, status: "running", taskFile: taskFilePath };
+
+    }
+
+    /**
+     * Starts the agent's Cloud Run Job execution and records it against the task.
+     *
+     * A failure here is a dispatch failure, not an agent failure: the Task File and the Task Record both
+     * already exist, so the task is marked `failed_to_start` and the error is re-thrown for the caller to see
+     * as a 500. The orphan Task File is left in place — it costs nothing and records something that was asked
+     * and never ran (docs/concept.md §3.1).
+     *
+     * A null execution name is recorded as null rather than as an empty string, so that "we never captured it"
+     * stays distinguishable from a real name.
+     *
+     * @param {Agent} agent - the resolved agent
+     * @param {string} taskId - the minted task id
+     * @param {TasksStore} store - the store holding the task's record
+     */
+    private async triggerExecution({ agent, taskId, store }: { agent: Agent, taskId: string, store: TasksStore }): Promise<void> {
+
+        try {
+
+            const executionName = await new CloudRunJobsAPI().runJob({ agent: agent, projectId: String(process.env.GCP_PID), taskId: taskId });
+
+            await store.updateTaskExecution({ taskId: taskId, executionName: executionName, status: "running" });
+
+        } catch (error: any) {
+
+            await store.updateTaskStatus({ taskId: taskId, status: "failed_to_start", error: { message: error?.message ?? String(error) } });
+
+            throw error;
+
+        }
 
     }
 
@@ -78,8 +116,8 @@ interface PostAgentTaskRequest {
 }
 
 interface PostAgentTaskResponse {
-    taskId: string;         // The minted task id. The caller's handle for GET /tasks/{taskId}.
-    agentId: string;        // The agent the task was dispatched to.
-    status: string;         // Status of the task. See docs/concept.md §4.4.
-    taskFile: string;       // Full gs:// path of the Task File.
+    taskId: string;             // The minted task id. The caller's handle for GET /tasks/{taskId}.
+    agentId: string;            // The agent the task was dispatched to.
+    status: string;             // Status of the task. See docs/concept.md §4.4.
+    taskFile: string;           // Full gs:// path of the Task File.
 }

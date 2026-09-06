@@ -38,7 +38,7 @@ Response, `201`:
 {
     "taskId": "5f3c1e7a-…",
     "agentId": "agent-coder",
-    "status": "starting",
+    "status": "running",
     "taskFile": "gs://{GCP_PID}-agents-data/coder/5f3c1e7a-…/task.json"
 }
 ```
@@ -50,3 +50,5 @@ Response, `201`:
 | `400` | The body is absent or is not a JSON object, or a field in the agent's `requiredTaskFields` is missing or blank. Every missing field is named at once. |
 | `404` | No agent is registered under `{agentId}`. |
 | `500` | The Task File could not be written, or the Cloud Run Job execution could not be started. |
+
+When the trigger itself fails, the Task File and the Task Record both already exist, so the task is left in the `failed_to_start` status with the failure recorded on it. The orphan Task File is not cleaned up: it costs nothing and records something that was asked and never ran. Retrying is safe, but it produces a **new** task with a new id — this endpoint has no idempotency key (see [concept OQ-04](../concept.md#7-open-questions)).

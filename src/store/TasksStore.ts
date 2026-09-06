@@ -41,10 +41,10 @@ export class TasksStore {
      * executions.list offers no filter — so this write is the only chance to keep it (docs/concept.md §3.2).
      *
      * @param {string} taskId - the task to update
-     * @param {string} executionName - the Cloud Run execution resource name
+     * @param {string | null} executionName - the Cloud Run execution resource name, or null when it could not be read
      * @param {TaskStatus} status - the status to move the task to
      */
-    async updateTaskExecution({ taskId, executionName, status }: { taskId: string, executionName: string, status: TaskStatus }): Promise<void> {
+    async updateTaskExecution({ taskId, executionName, status }: { taskId: string, executionName: string | null, status: TaskStatus }): Promise<void> {
 
         await this.db.collection(this.tasksCollection).updateOne({ taskId: taskId }, { $set: { executionName: executionName, status: status, updatedAt: new Date() } });
 

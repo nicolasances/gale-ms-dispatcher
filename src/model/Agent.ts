@@ -75,6 +75,21 @@ export class Agent {
     }
 
     /**
+     * Builds the fully qualified Cloud Run Job resource name to execute for this agent.
+     *
+     * Uses the agent's own region, which need not be the region this service runs in.
+     *
+     * @param {string} projectId - the GCP project holding the job
+     *
+     * @returns {string} the job resource name
+     */
+    jobResourceName({ projectId }: { projectId: string }): string {
+
+        return `projects/${projectId}/locations/${this.region}/jobs/${this.jobName}`;
+
+    }
+
+    /**
      * Checks that a task payload field carries an actual value.
      *
      * @param {any} value - the field's value
