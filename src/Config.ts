@@ -2,7 +2,7 @@ import { APIOptions, TotoControllerConfig } from 'totoms';
 import { Agent } from './model/Agent';
 import { AgentRegistry } from './model/AgentRegistry';
 
-const dbName = 'gale';
+const dbName = 'galedisp';
 const collections = {
     tasks: 'tasks',
 };
